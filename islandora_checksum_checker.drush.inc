@@ -116,7 +116,14 @@ function drush_islandora_checksum_checker_run_islandora_checksum_queue() {
     }
   }
 
-  $objects_to_check = islandora_checksum_checker_get_objects($limit);
+  $collection_pid = variable_get('islandora_checksum_checker_collection', '');
+
+  if ($collection_pid != '') {
+    watchdog('islandora_checksum_checker', "Processing collection: " . $collection_pid);
+    $objects_to_check = islandora_checksum_checker_get_objects_by_collection($limit, $collection_pid);
+  } else {
+    $objects_to_check = islandora_checksum_checker_get_objects($limit);
+  }
 
   foreach ($objects_to_check as $object) {
     $queue->createItem($object);

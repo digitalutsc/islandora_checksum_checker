@@ -23,6 +23,9 @@ function islandora_checksum_checker_cron() {
 
     $objects_to_check = islandora_checksum_checker_get_objects($limit);
 
+
+
+
     foreach ($objects_to_check as $object) {
       $queue->createItem($object);
     }
@@ -119,6 +122,20 @@ function islandora_checksum_checker_admin_settings() {
     '#description' => t("Checksum mismatches are emailed to the address(es) in 'Send
       report to', above. Check this option if you also want mismatches to be logged
       (which is advisable in case the email messages fail to get sent)."),
+  );
+  $form['islandora_checksum_checker_collection'] = array(
+    '#title' => t('Collection to run checksum checker on'),
+    '#type' => 'textfield',
+    '#size' => 60,
+    '#default_value' => variable_get('islandora_checksum_checker_collection', ''),
+    '#description' => t("Collection to run checksum checker on."),
+    '#maxlength' => 255,
+  );
+  $form['islandora_checksum_checker_last_item_checked'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Continue the batch'),
+    '#default_value' => variable_get('islandora_checksum_checker_last_item_checked', 0),
+    '#description' => t("Uncheck to restart from the begingging."),
   );
 
   return system_settings_form($form);
@@ -284,6 +301,13 @@ function islandora_checksum_checker_validate_checksum($pid) {
         $log_message = array('logMessage' => trim($fixity_event_message));
         try {
           $tuque->api->m->modifyObject($pid, $log_message);
+          watchdog('islandora_checksum_checker', 'Checking !object, !ds_id !message',
+            array(
+              '!object' => $pid,
+              '!ds_id' => $ds->id,
+              '!message' => $fixity_event_message,
+            ),
+            WATCHDOG_INFO);
         }
         catch (RepositoryException $e) {
           watchdog('islandora_checksum_checker', 'Unable to add fixity event message for !object, !ds_id: !message',
@@ -379,6 +403,89 @@ EOQ;
 
   return $objects_to_check;
 }
+
+
+/**
+ * Query the RI index.
+ *
+ * Gets PIDs of all objects that are not collection objects. Uses the
+ * system variable 'islandora_checksum_checker_last_item_checked' to page
+ * through all the objects in the repo.
+ *
+ * @param int $limit
+ *   The number of items to add to the queue.
+ *
+ * @return array
+ *   An array of PIDs.
+ */
+function islandora_checksum_checker_get_objects_by_collection($limit, $collection_pid) {
+  $offset = variable_get('islandora_checksum_checker_last_item_checked', '0');
+  // We need to add 1 to the offset so we can use it in the RI query, except
+  // the first time this function is invoked
+  // ('islandora_checksum_checker_last_item_checked' is set to 0 in the
+  // .install file) or when we have completed a validation cycle and reset
+  // $offset to 0 below.
+  if ($offset == '0') {
+    $query_offset = '0';
+  }
+  else {
+    $query_offset = (int) $offset + 1;
+  }
+
+  // Query the rindex to get all the objects that have a 'isMemberOfCollection'
+  // relationship but that do not have a 'islandora:collectionCModel' content
+  // model. Sort oldest to newest.
+  $user = user_load(1);
+  drupal_static_reset('islandora_get_tuque_connection');
+  $tuque = islandora_get_tuque_connection($user);
+
+  $ri_query = <<<EOQ
+SELECT DISTINCT ?object ?created
+FROM <#ri>
+WHERE {
+  {
+    ?object <fedora-rels-ext:isMemberOfCollection> <info:fedora/$collection_pid> .
+  } UNION {
+    ?object <http://islandora.ca/ontology/relsext#isPageOf> ?book .
+    ?book <fedora-rels-ext:isMemberOfCollection> <info:fedora/$collection_pid> .
+  } UNION {
+    ?object <fedora-rels-ext:isConstituentOf> ?compound .
+    ?compound <fedora-rels-ext:isMemberOfCollection> <info:fedora/$collection_pid> .
+  } UNION {
+    ?object <fedora-rels-ext:isMemberOf> ?issue .
+    ?issue <fedora-rels-ext:isMemberOf> ?newspaper .
+    ?newspaper <fedora-rels-ext:isMemberOfCollection> <info:fedora/$collection_pid> .
+  }
+  ?object <fedora-model:createdDate> ?created .}
+LIMIT $limit
+OFFSET $query_offset  
+EOQ;
+
+  $results = $tuque->repository->ri->sparqlQuery($ri_query, 'unlimited');
+
+  foreach ($results as $member) {
+    $objects_to_check[] = $member['object']['value'];
+  }
+
+  // If the number of results returned is fewer than $limit, assume
+  // that we have gotten all objects from the rindex and reset
+  // $offset to 0.
+  if (count($results) < $limit) {
+    $offset = 0;
+    if (variable_get('islandora_checksum_checker_send_complete_message', 0)) {
+      islandora_checksum_checker_send_check_complete_message();
+      variable_set('islandora_checksum_checker_mismatches', array());
+    }
+  }
+  else {
+    $offset = (int) $offset + (int) $limit;
+  }
+  // Update the offset for use in next cron run.
+  variable_set('islandora_checksum_checker_last_item_checked', $offset);
+
+  return $objects_to_check;
+}
+
 
 /**
  * Query the RI index for a count.
